@@ -9,6 +9,7 @@ import gc
 import shutil
 import uuid
 import hashlib
+import base64
 
 # --- FIX FOR "ANTIALIAS" ERROR ---
 import PIL.Image
@@ -163,6 +164,44 @@ def handle_gemini_batch():
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
+# --- UPLOAD AUDIO (base64 -> hosted file) ---
+@app.route('/upload_audio', methods=['POST'])
+def handle_audio_upload():
+    data = request.json
+    audio_b64 = data.get('audio_base64', '')
+    fmt = data.get('format', 'mp3')
+
+    if not audio_b64:
+        return jsonify({"error": "Missing audio_base64"}), 400
+
+    try:
+        audio_id = uuid.uuid4().hex[:12]
+        audio_path = f"{OUTPUT_DIR}/audio_{audio_id}.{fmt}"
+        with open(audio_path, 'wb') as f:
+            f.write(base64.b64decode(audio_b64))
+
+        rendered_files[f"audio_{audio_id}"] = {
+            "path": audio_path,
+            "created_at": time.time(),
+            "status": "ready"
+        }
+
+        return jsonify({
+            "status": "success",
+            "audio_id": audio_id,
+            "url": f"https://youtube-renderer-production.up.railway.app/audio/{audio_id}"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/audio/<audio_id>', methods=['GET'])
+def serve_audio(audio_id):
+    key = f"audio_{audio_id}"
+    if key not in rendered_files:
+        return jsonify({"error": "Audio not found"}), 404
+    info = rendered_files[key]
+    return send_file(info['path'], mimetype='audio/mpeg')
+
 # --- DIRECTOR MODE (RENDER) ---
 def process_timeline_job(data, job_id):
     print(f"Starting render job {job_id}...")
@@ -246,12 +285,17 @@ def process_timeline_job(data, job_id):
             if url in asset_map:
                 try:
                     clip = VideoFileClip(asset_map[url]).without_audio()
-                    # Ensure source_start doesn't exceed clip duration
+                    # Clamp source_start to valid range within actual clip duration
+                    max_start = max(0, clip.duration - 0.5)  # at least 0.5s playable
+                    if s_start >= clip.duration:
+                        print(f"WARNING: source_start {s_start}s exceeds clip duration {clip.duration}s for clip {index}, clamping to 0")
+                        s_start = 0
                     if s_start + duration > clip.duration:
                         s_start = max(0, clip.duration - duration)
                     if s_start < 0:
                         s_start = 0
-                    clip = clip.subclip(s_start, min(s_start + duration, clip.duration))
+                    actual_end = min(s_start + duration, clip.duration)
+                    clip = clip.subclip(s_start, actual_end)
                     clip = clip.resize(height=1920)
                     if clip.w < 1080:
                         clip = clip.resize(width=1080)

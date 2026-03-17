@@ -112,12 +112,14 @@ def handle_gemini_batch():
         else:
             voiceover_result = None
 
-        # Upload videos
+        # Upload videos with generic names
+        use_generic = data.get('use_generic_names', False)
         for i, url in enumerate(urls):
             try:
-                local_path = f"/tmp/upload_{uuid.uuid4().hex[:8]}.mp4"
+                local_path = f"/tmp/video_{i+1}.mp4"
                 if download_file(url, local_path):
-                    uploaded = genai.upload_file(local_path, mime_type="video/mp4")
+                    display_name = f"video_{i+1}.mp4" if use_generic else None
+                    uploaded = genai.upload_file(local_path, mime_type="video/mp4", display_name=display_name)
                     uploaded_files.append({"file_uri": uploaded.uri, "name": uploaded.name})
                     os.remove(local_path)
                     print(f"Uploaded {i+1}/{len(urls)}")
@@ -127,9 +129,34 @@ def handle_gemini_batch():
                 uploaded_files.append({"file_uri": "", "name": "", "error": str(e)})
                 print(f"Upload error for {url}: {e}")
 
+        # Wait for files to become ACTIVE
+        print("Waiting for files to become ACTIVE...")
+        time.sleep(30)
+
+        # Verify file states
+        active_files = []
+        for f_info in uploaded_files:
+            if f_info.get('file_uri'):
+                try:
+                    f = genai.get_file(f_info['name'])
+                    if f.state.name == 'ACTIVE':
+                        active_files.append(f_info)
+                    else:
+                        print(f"File {f_info['name']} state: {f.state.name}, waiting...")
+                        time.sleep(10)
+                        f = genai.get_file(f_info['name'])
+                        if f.state.name == 'ACTIVE':
+                            active_files.append(f_info)
+                        else:
+                            active_files.append({**f_info, "state": f.state.name})
+                except:
+                    active_files.append(f_info)
+            else:
+                active_files.append(f_info)
+
         return jsonify({
             "status": "success",
-            "files": uploaded_files,
+            "files": active_files,
             "voiceover": voiceover_result
         })
 

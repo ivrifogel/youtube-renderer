@@ -14,9 +14,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download whisper tiny model at build time
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-tiny', local_dir='/app/model', local_dir_use_symlinks=False)" || \
-    python3 -c "import urllib.request, os; os.makedirs('/app/model', exist_ok=True); [urllib.request.urlretrieve(f'https://huggingface.co/Systran/faster-whisper-tiny/resolve/main/{f}', f'/app/model/{f}') for f in ['model.bin','config.json','vocabulary.txt']]"
+# Download whisper tiny model at build time using urllib only
+RUN python3 -c "\
+import urllib.request, os;\
+os.makedirs('/app/model', exist_ok=True);\
+files = ['model.bin','config.json','vocabulary.txt','tokenizer.json'];\
+[urllib.request.urlretrieve(f'https://huggingface.co/Systran/faster-whisper-tiny/resolve/main/{f}', f'/app/model/{f}') for f in files if not f.startswith('tokenizer')];\
+print('Model downloaded')"
 
 COPY main.py .
 

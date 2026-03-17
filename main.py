@@ -129,9 +129,9 @@ def handle_gemini_batch():
                 uploaded_files.append({"file_uri": "", "name": "", "error": str(e)})
                 print(f"Upload error for {url}: {e}")
 
-        # Wait for files to become ACTIVE
+        # Wait for files to become ACTIVE (20 files needs more time)
         print("Waiting for files to become ACTIVE...")
-        time.sleep(30)
+        time.sleep(90)
 
         # Verify file states
         active_files = []

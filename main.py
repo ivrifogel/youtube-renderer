@@ -174,30 +174,35 @@ def process_timeline_job(data, job_id):
     output_path = f"{OUTPUT_DIR}/{job_id}.mp4"
 
     try:
-        audio_url = data.get('audio_url')
+        audio_url = data.get('audio_url', '')
         music_url = data.get('music_url')
         edl = data.get('timeline', [])
+        script_text = data.get('script', '')
         font_path = download_font()
 
-        if not audio_url:
-            raise Exception("Missing 'audio_url'")
+        has_voiceover = False
         local_audio_path = f"{base_dir}/master_audio.mp3"
-        if not download_file(audio_url, local_audio_path):
-            raise Exception(f"Could not download audio from: {audio_url}")
-
-        # --- Transcribe ---
-        print("Loading Whisper Model...")
-        model = get_whisper_model()
-        segments, _ = model.transcribe(local_audio_path, word_timestamps=True)
         subs = []
-        for s in segments:
-            for w in s.words:
-                clean = w.word.strip().upper().replace('"', '').replace('.', '').replace(',', '')
-                if clean:
-                    subs.append(((w.start, w.end), clean))
-        del model
-        gc.collect()
-        print(f"Transcription complete: {len(subs)} words")
+
+        if audio_url and audio_url.strip():
+            if download_file(audio_url, local_audio_path):
+                has_voiceover = True
+                # --- Transcribe ---
+                print("Loading Whisper Model...")
+                model = get_whisper_model()
+                segments, _ = model.transcribe(local_audio_path, word_timestamps=True)
+                for s in segments:
+                    for w in s.words:
+                        clean = w.word.strip().upper().replace('"', '').replace('.', '').replace(',', '')
+                        if clean:
+                            subs.append(((w.start, w.end), clean))
+                del model
+                gc.collect()
+                print(f"Transcription complete: {len(subs)} words")
+            else:
+                print("Voiceover download failed, rendering without audio")
+        else:
+            print("No voiceover provided, rendering video-only")
 
         # Fill subtitle gaps
         filled_subs = []
@@ -212,8 +217,13 @@ def process_timeline_job(data, job_id):
                     end = next_start
             filled_subs.append(((start, end), text))
 
-        master_audio_clip = AudioFileClip(local_audio_path)
-        final_duration = master_audio_clip.duration
+        if has_voiceover:
+            master_audio_clip = AudioFileClip(local_audio_path)
+            final_duration = master_audio_clip.duration
+        else:
+            master_audio_clip = None
+            # Calculate duration from timeline
+            final_duration = max([float(cut.get('timeline_end', 0)) for cut in edl]) if edl else 30.0
 
         # --- Process video clips ---
         final_clips = []
@@ -260,21 +270,27 @@ def process_timeline_job(data, job_id):
         video_layer = CompositeVideoClip(final_clips, size=(1080, 1920)).set_duration(final_duration)
 
         # Audio: voiceover + optional music
+        audio_tracks = []
+        if master_audio_clip:
+            audio_tracks.append(master_audio_clip)
+
         if music_url:
             local_music = f"{base_dir}/music.mp3"
             if download_file(music_url, local_music):
-                music_track = AudioFileClip(local_music).volumex(0.08)
+                music_track = AudioFileClip(local_music).volumex(0.08 if master_audio_clip else 0.3)
                 if music_track.duration < final_duration:
                     music_track = afx.audio_loop(music_track, duration=final_duration)
                 else:
                     music_track = music_track.set_duration(final_duration)
-                final_audio = CompositeAudioClip([master_audio_clip, music_track])
-            else:
-                final_audio = master_audio_clip
-        else:
-            final_audio = master_audio_clip
+                audio_tracks.append(music_track)
 
-        video_layer = video_layer.set_audio(final_audio)
+        if audio_tracks:
+            final_audio = CompositeAudioClip(audio_tracks) if len(audio_tracks) > 1 else audio_tracks[0]
+        else:
+            final_audio = None
+
+        if final_audio:
+            video_layer = video_layer.set_audio(final_audio)
 
         # --- Subtitles ---
         def sub_generator(txt):
@@ -289,8 +305,11 @@ def process_timeline_job(data, job_id):
                 size=(1000, None)
             )
 
-        subtitles = SubtitlesClip(filled_subs, sub_generator).set_position('center')
-        final_export = CompositeVideoClip([video_layer, subtitles])
+        if filled_subs:
+            subtitles = SubtitlesClip(filled_subs, sub_generator).set_position('center')
+            final_export = CompositeVideoClip([video_layer, subtitles])
+        else:
+            final_export = video_layer
 
         # --- Render ---
         print("Rendering...")

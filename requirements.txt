@@ -1,9 +1,7 @@
-Flask==3.0.0
-requests==2.31.0
-moviepy==1.0.3
-faster-whisper==1.0.3
-gunicorn==21.2.0
-imageio==2.33.1
-imageio-ffmpeg==0.4.9
+flask
+gunicorn
+requests
+google-cloud-storage
+google-auth
+faster-whisper
 google-generativeai>=0.7.0
-Pillow>=10.0.0

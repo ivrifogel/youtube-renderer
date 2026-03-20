@@ -8,30 +8,30 @@ import json
 import gc
 import shutil
 import uuid
-import hashlib
 import base64
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
-# --- FIX FOR "ANTIALIAS" ERROR ---
 import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 
 from flask import Flask, request, jsonify, send_file
-from moviepy.editor import *
-from moviepy.video.tools.subtitles import SubtitlesClip
+from google.cloud import storage as gcs_storage
 from faster_whisper import WhisperModel
 import google.generativeai as genai
+import google.auth
+import google.auth.transport.requests as gauth_requests
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-RENDER_PRESET = "ultrafast"
-RENDER_FPS = 30
-RENDER_THREADS = 2
+RENDER_FPS = 24
+GCS_BUCKET = "cashflow-shorts-videos"
 OUTPUT_DIR = "/tmp/rendered_videos"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+SERVICE_ACCOUNT_EMAIL = "693305496226-compute@developer.gserviceaccount.com"
 
-# --- API KEY SETUP ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     try:
@@ -39,58 +39,109 @@ if GEMINI_API_KEY:
     except Exception as e:
         print(f"API Key Config Error: {e}")
 
-# ASSETS
-TRANSITION_VIDEO_URL = "https://storage.googleapis.com/youtube-videogeneration/LightLeak.mp4"
-FONT_URL = "https://raw.githubusercontent.com/JulietaUla/Montserrat/master/fonts/ttf/Montserrat-Black.ttf"
+# Pre-download font at startup
+FONT_PATH = "/tmp/Poppins-Medium.ttf"
+FONT_URL = "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Medium.ttf"
 
-# Track rendered files for download
-rendered_files = {}
+# --- PRE-LOAD WHISPER MODEL ---
+def _load_whisper_model():
+    print("Pre-loading Whisper model...")
+    start = time.time()
+    if os.path.exists("/app/model"):
+        model = WhisperModel("/app/model", device="cpu", compute_type="int8")
+    else:
+        local_model_dir = "/tmp/manual_whisper_tiny"
+        os.makedirs(local_model_dir, exist_ok=True)
+        base_url = "https://huggingface.co/Systran/faster-whisper-tiny/resolve/main"
+        for f in ["model.bin", "config.json", "vocabulary.txt"]:
+            path = f"{local_model_dir}/{f}"
+            if not os.path.exists(path):
+                requests.get(f"{base_url}/{f}", timeout=30).raise_for_status()
+                with open(path, 'wb') as fh:
+                    fh.write(requests.get(f"{base_url}/{f}").content)
+        model = WhisperModel(local_model_dir, device="cpu", compute_type="int8")
+    print(f"Whisper model loaded in {time.time()-start:.1f}s")
+    return model
+
+WHISPER_MODEL = _load_whisper_model()
+
 
 # --- HELPER FUNCTIONS ---
 def download_file(url, local_filename):
-    if os.path.exists(local_filename):
-        if os.path.getsize(local_filename) > 0:
-            return local_filename
-        else:
-            os.remove(local_filename)
-
-    print(f"Downloading: {url} -> {local_filename}")
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        with requests.get(url, stream=True, timeout=120, headers=headers) as r:
-            r.raise_for_status()
-            with open(local_filename, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
+    if os.path.exists(local_filename) and os.path.getsize(local_filename) > 0:
         return local_filename
+
+    # GCS direct download (internal network)
+    if 'storage.googleapis.com/' in url:
+        try:
+            parts = url.replace('https://storage.googleapis.com/', '').split('/', 1)
+            client = gcs_storage.Client()
+            blob = client.bucket(parts[0]).blob(parts[1])
+            blob.download_to_filename(local_filename)
+            return local_filename
+        except Exception as e:
+            print(f"  GCS failed: {e}")
+
+    # HTTP download
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        with requests.get(url, stream=True, timeout=120, headers=headers, allow_redirects=True) as r:
+            r.raise_for_status()
+            if 'text/html' in r.headers.get('Content-Type', ''):
+                print(f"  Got HTML: {url}")
+                return None
+            with open(local_filename, 'wb') as f:
+                for chunk in r.iter_content(8192):
+                    f.write(chunk)
+        if os.path.exists(local_filename) and os.path.getsize(local_filename) > 0:
+            return local_filename
+        return None
     except Exception as e:
-        print(f"Download Error for {url}: {e}")
+        print(f"  Download error: {e}")
         return None
 
+
 def download_font():
-    local_font_path = "/tmp/Montserrat-Black.ttf"
-    download_file(FONT_URL, local_font_path)
-    return local_font_path if os.path.exists(local_font_path) else None
+    if not os.path.exists(FONT_PATH):
+        download_file(FONT_URL, FONT_PATH)
+    return FONT_PATH if os.path.exists(FONT_PATH) else None
 
-def get_whisper_model():
-    """Load whisper model - use pre-downloaded or download manually."""
-    if os.path.exists("/app/model"):
-        return WhisperModel("/app/model", device="cpu", compute_type="int8")
 
-    base_url = "https://huggingface.co/Systran/faster-whisper-tiny/resolve/main"
-    files = ["model.bin", "config.json", "vocabulary.txt"]
-    local_model_dir = "/tmp/manual_whisper_tiny"
-    os.makedirs(local_model_dir, exist_ok=True)
+def get_video_duration(path):
+    """Get video duration using ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10
+        )
+        return float(result.stdout.strip())
+    except:
+        return 0.0
 
-    for filename in files:
-        url = f"{base_url}/{filename}"
-        local_path = f"{local_model_dir}/{filename}"
-        if not download_file(url, local_path):
-            raise Exception(f"Failed to download model file: {filename}")
 
-    return WhisperModel(local_model_dir, device="cpu", compute_type="int8")
+def group_words_into_chunks(word_subs, max_words=3):
+    if not word_subs:
+        return []
+    chunks = []
+    i = 0
+    while i < len(word_subs):
+        chunk_words = []
+        chunk_start = word_subs[i][0][0]
+        chunk_end = word_subs[i][0][1]
+        for j in range(max_words):
+            if i + j >= len(word_subs):
+                break
+            chunk_words.append(word_subs[i + j][1])
+            chunk_end = word_subs[i + j][0][1]
+        chunks.append(((chunk_start, chunk_end), " ".join(chunk_words)))
+        i += len(chunk_words)
+    return chunks
 
-# --- BATCH UPLOAD TO GEMINI ---
+
+# =============================================
+# BATCH UPLOAD TO GEMINI
+# =============================================
 @app.route('/batch_upload_gemini', methods=['POST'])
 def handle_gemini_batch():
     data = request.json
@@ -104,355 +155,473 @@ def handle_gemini_batch():
         uploaded_files = []
 
         # Upload voiceover first
-        if voiceover_url:
+        voiceover_result = None
+        if voiceover_url and voiceover_url.strip():
             vo_path = f"/tmp/vo_{uuid.uuid4().hex[:8]}.mp3"
-            download_file(voiceover_url, vo_path)
-            vo_file = genai.upload_file(vo_path, mime_type="audio/mpeg")
-            voiceover_result = {"file_uri": vo_file.uri, "name": vo_file.name}
-            os.remove(vo_path)
-        else:
-            voiceover_result = None
+            if download_file(voiceover_url, vo_path):
+                try:
+                    vo_file = genai.upload_file(vo_path, mime_type="audio/mpeg")
+                    voiceover_result = {"file_uri": vo_file.uri, "name": vo_file.name}
+                except Exception as ve:
+                    print(f"Voiceover upload failed: {ve}")
+                finally:
+                    if os.path.exists(vo_path):
+                        os.remove(vo_path)
 
-        # Upload videos with generic names
-        use_generic = data.get('use_generic_names', False)
+        # Upload videos to GCS + Gemini
+        gcs_client = gcs_storage.Client()
+        gcs_bucket = gcs_client.bucket(GCS_BUCKET)
+
         for i, url in enumerate(urls):
             try:
-                local_path = f"/tmp/video_{i+1}.mp4"
+                local_path = f"/tmp/video_{i+1:02d}.mp4"
                 if download_file(url, local_path):
-                    display_name = f"video_{i+1}.mp4" if use_generic else None
+                    # Upload to GCS
+                    try:
+                        blob = gcs_bucket.blob(f"temp-stock-videos/video_{i+1:02d}.mp4")
+                        blob.upload_from_filename(local_path, content_type="video/mp4")
+                    except Exception as ge:
+                        print(f"GCS upload failed: {ge}")
+
+                    # Upload to Gemini
+                    display_name = f"video_{i+1:02d}.mp4"
                     uploaded = genai.upload_file(local_path, mime_type="video/mp4", display_name=display_name)
-                    uploaded_files.append({"file_uri": uploaded.uri, "name": uploaded.name})
+                    uploaded_files.append({
+                        "file_uri": uploaded.uri,
+                        "name": uploaded.name,
+                        "gcs_url": f"https://storage.googleapis.com/{GCS_BUCKET}/temp-stock-videos/video_{i+1:02d}.mp4"
+                    })
                     os.remove(local_path)
                     print(f"Uploaded {i+1}/{len(urls)}")
                 else:
-                    uploaded_files.append({"file_uri": "", "name": "", "error": f"Download failed: {url}"})
+                    uploaded_files.append({"file_uri": "", "name": "", "error": f"Download failed"})
             except Exception as e:
                 uploaded_files.append({"file_uri": "", "name": "", "error": str(e)})
-                print(f"Upload error for {url}: {e}")
 
-        # Wait for files to become ACTIVE (20 files needs more time)
-        print("Waiting for files to become ACTIVE...")
-        time.sleep(90)
-
-        # Verify file states
-        active_files = []
-        for f_info in uploaded_files:
-            if f_info.get('file_uri'):
+        # Poll for ACTIVE state (instead of hard sleep)
+        print("Polling for ACTIVE state...")
+        for poll in range(18):
+            all_active = True
+            for f_info in uploaded_files:
+                if not f_info.get('file_uri'):
+                    continue
                 try:
                     f = genai.get_file(f_info['name'])
-                    if f.state.name == 'ACTIVE':
-                        active_files.append(f_info)
-                    else:
-                        print(f"File {f_info['name']} state: {f.state.name}, waiting...")
-                        time.sleep(10)
-                        f = genai.get_file(f_info['name'])
-                        if f.state.name == 'ACTIVE':
-                            active_files.append(f_info)
-                        else:
-                            active_files.append({**f_info, "state": f.state.name})
+                    if f.state.name != 'ACTIVE':
+                        all_active = False
+                        break
                 except:
-                    active_files.append(f_info)
-            else:
-                active_files.append(f_info)
+                    pass
+            if all_active:
+                print(f"All files ACTIVE after {(poll+1)*10}s")
+                break
+            if poll < 17:
+                time.sleep(10)
 
         return jsonify({
             "status": "success",
-            "files": active_files,
+            "files": uploaded_files,
             "voiceover": voiceover_result
         })
 
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
-# --- UPLOAD AUDIO (base64 -> hosted file) ---
+
+# =============================================
+# UPLOAD AUDIO (base64 -> hosted file)
+# =============================================
 @app.route('/upload_audio', methods=['POST'])
 def handle_audio_upload():
     data = request.json
     audio_b64 = data.get('audio_base64', '')
     fmt = data.get('format', 'mp3')
-
     if not audio_b64:
         return jsonify({"error": "Missing audio_base64"}), 400
-
     try:
         audio_id = uuid.uuid4().hex[:12]
         audio_path = f"{OUTPUT_DIR}/audio_{audio_id}.{fmt}"
         with open(audio_path, 'wb') as f:
             f.write(base64.b64decode(audio_b64))
-
-        rendered_files[f"audio_{audio_id}"] = {
-            "path": audio_path,
-            "created_at": time.time(),
-            "status": "ready"
-        }
-
         return jsonify({
             "status": "success",
             "audio_id": audio_id,
-            "url": f"https://youtube-renderer-production.up.railway.app/audio/{audio_id}"
+            "url": f"{request.host_url.rstrip('/')}/audio/{audio_id}"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/audio/<audio_id>', methods=['GET'])
 def serve_audio(audio_id):
-    key = f"audio_{audio_id}"
-    if key not in rendered_files:
-        return jsonify({"error": "Audio not found"}), 404
-    info = rendered_files[key]
-    return send_file(info['path'], mimetype='audio/mpeg')
+    for ext in ['mp3', 'wav', 'aac']:
+        path = f"{OUTPUT_DIR}/audio_{audio_id}.{ext}"
+        if os.path.exists(path):
+            return send_file(path, mimetype='audio/mpeg')
+    return jsonify({"error": "Audio not found"}), 404
 
-# --- DIRECTOR MODE (RENDER) ---
-def process_timeline_job(data, job_id):
-    print(f"Starting render job {job_id}...")
-    base_dir = f"/tmp/render_{job_id}"
+
+# =============================================
+# PURE FFmpeg RENDER PIPELINE
+# =============================================
+def process_timeline_job(data, webhook_url):
+    """
+    Render pipeline:
+    1. Download clips in parallel
+    2. FFmpeg: extract subclips + scale/crop to 1080x1920 + concat
+    3. Whisper: transcribe voiceover -> subtitles
+    4. FFmpeg: burn subtitles using ASS format
+    5. FFmpeg: mix audio (voiceover + music)
+    6. FFmpeg: mux final video + audio
+    7. Upload to GCS
+    8. Webhook callback
+    """
+    job_start_time = time.time()
+    print("=== RENDER JOB START ===")
+    base_dir = f"/tmp/render_{uuid.uuid4().hex[:8]}"
     os.makedirs(base_dir, exist_ok=True)
-    user_filename = data.get('filename', f"video_{job_id}").strip().replace(" ", "_")
+    user_filename = data.get('filename', 'video').strip().replace(" ", "_")
     if not user_filename.lower().endswith('.mp4'):
         user_filename += ".mp4"
-    output_path = f"{OUTPUT_DIR}/{job_id}.mp4"
+    output_path = f"{base_dir}/{user_filename}"
 
     try:
         audio_url = data.get('audio_url', '')
         music_url = data.get('music_url')
         edl = data.get('timeline', [])
-        script_text = data.get('script', '')
-        font_path = download_font()
+        script_hint = data.get('script', '')
 
+        # --- Step 1: Download voiceover + determine duration ---
         has_voiceover = False
-        local_audio_path = f"{base_dir}/master_audio.mp3"
-        subs = []
+        local_audio = f"{base_dir}/voiceover.mp3"
+        final_duration = 0.0
 
         if audio_url and audio_url.strip():
-            if download_file(audio_url, local_audio_path):
+            if download_file(audio_url, local_audio):
                 has_voiceover = True
-                # --- Transcribe ---
-                print("Loading Whisper Model...")
-                model = get_whisper_model()
-                segments, _ = model.transcribe(local_audio_path, word_timestamps=True)
-                for s in segments:
-                    for w in s.words:
-                        clean = w.word.strip().upper().replace('"', '').replace('.', '').replace(',', '')
-                        if clean:
-                            subs.append(((w.start, w.end), clean))
-                del model
-                gc.collect()
-                print(f"Transcription complete: {len(subs)} words")
-            else:
-                print("Voiceover download failed, rendering without audio")
-        else:
-            print("No voiceover provided, rendering video-only")
+                final_duration = get_video_duration(local_audio)
+                print(f"Voiceover: {final_duration:.1f}s")
 
-        # Fill subtitle gaps
-        filled_subs = []
-        for j in range(len(subs)):
-            start, end = subs[j][0]
-            text = subs[j][1]
-            if j == 0:
-                start = 0.0
-            if j < len(subs) - 1:
-                next_start = subs[j+1][0][0]
-                if next_start > end:
-                    end = next_start
-            filled_subs.append(((start, end), text))
+        if not has_voiceover:
+            final_duration = max([float(c.get('timeline_end', 0)) for c in edl]) if edl else 30.0
 
-        if has_voiceover:
-            master_audio_clip = AudioFileClip(local_audio_path)
-            final_duration = master_audio_clip.duration
-        else:
-            master_audio_clip = None
-            # Calculate duration from timeline
-            final_duration = max([float(cut.get('timeline_end', 0)) for cut in edl]) if edl else 30.0
-
-        # --- Process video clips ---
-        final_clips = []
+        # --- Step 2: Download all clips in parallel ---
         asset_map = {}
-
-        for index, cut in enumerate(edl):
+        unique_urls = []
+        for cut in edl:
             url = cut.get('url')
-            t_start = float(cut.get('timeline_start', 0.0))
-            t_end = float(cut.get('timeline_end', 0.0))
-            s_start = float(cut.get('source_start', 0.0))
+            if url and url not in asset_map:
+                l_path = f"{base_dir}/src_{len(asset_map)}.mp4"
+                asset_map[url] = l_path
+                unique_urls.append((url, l_path))
+
+        def dl_task(args):
+            return download_file(args[0], args[1])
+
+        print(f"Downloading {len(unique_urls)} clips...")
+        dl_start = time.time()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(dl_task, unique_urls))
+
+        for (url, path), result in zip(unique_urls, results):
+            if not result:
+                del asset_map[url]
+        print(f"Downloads done: {len(asset_map)} clips in {time.time()-dl_start:.1f}s")
+
+        # --- Step 3: FFmpeg extract + scale each segment ---
+        print(f"Extracting {len(edl)} segments...")
+        extract_start = time.time()
+        segment_paths = []
+
+        for idx, cut in enumerate(edl):
+            url = cut.get('url')
+            t_start = float(cut.get('timeline_start', 0))
+            t_end = float(cut.get('timeline_end', 0))
+            s_start = float(cut.get('source_start', 0))
             duration = t_end - t_start
-            if duration <= 0 or t_start >= final_duration:
+            if duration <= 0 or url not in asset_map:
                 continue
 
-            if url not in asset_map:
-                l_path = f"{base_dir}/v_{len(asset_map)}.mp4"
-                if download_file(url, l_path):
-                    asset_map[url] = l_path
+            seg_path = f"{base_dir}/seg_{idx:03d}.mp4"
 
-            if url in asset_map:
-                try:
-                    clip = VideoFileClip(asset_map[url]).without_audio()
-                    # Clamp source_start to valid range within actual clip duration
-                    max_start = max(0, clip.duration - 0.5)  # at least 0.5s playable
-                    if s_start >= clip.duration:
-                        print(f"WARNING: source_start {s_start}s exceeds clip duration {clip.duration}s for clip {index}, clamping to 0")
-                        s_start = 0
-                    if s_start + duration > clip.duration:
-                        s_start = max(0, clip.duration - duration)
-                    if s_start < 0:
-                        s_start = 0
-                    actual_end = min(s_start + duration, clip.duration)
-                    clip = clip.subclip(s_start, actual_end)
-                    clip = clip.resize(height=1920)
-                    if clip.w < 1080:
-                        clip = clip.resize(width=1080)
-                    clip = clip.crop(x_center=clip.w/2, y_center=clip.h/2, width=1080, height=1920)
-                    clip = clip.set_start(t_start).set_duration(duration)
-                    final_clips.append(clip)
-                    gc.collect()
-                except Exception as e:
-                    print(f"Error processing clip {index} ({url}): {e}")
+            # Clamp source_start to actual duration
+            src_dur = get_video_duration(asset_map[url])
+            if src_dur > 0 and s_start + duration > src_dur:
+                s_start = max(0, src_dur - duration)
 
-        if not final_clips:
-            raise Exception("No video clips were processed!")
+            # Single FFmpeg command: seek + scale + crop + re-encode (ultrafast)
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(max(0, s_start)),
+                "-i", asset_map[url],
+                "-t", str(duration),
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-r", str(RENDER_FPS),
+                "-an", "-sn",
+                "-pix_fmt", "yuv420p",
+                seg_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
 
-        # --- Composite ---
-        print(f"Compositing {len(final_clips)} clips...")
-        video_layer = CompositeVideoClip(final_clips, size=(1080, 1920)).set_duration(final_duration)
+            if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+                segment_paths.append(seg_path)
+            else:
+                print(f"  Segment {idx} failed")
 
-        # Audio: voiceover + optional music
-        audio_tracks = []
-        if master_audio_clip:
-            audio_tracks.append(master_audio_clip)
+        if not segment_paths:
+            raise Exception("No segments extracted!")
+        print(f"Extraction done: {len(segment_paths)} segments in {time.time()-extract_start:.1f}s")
 
-        if music_url:
-            local_music = f"{base_dir}/music.mp3"
-            if download_file(music_url, local_music):
-                music_track = AudioFileClip(local_music).volumex(0.08 if master_audio_clip else 0.3)
-                if music_track.duration < final_duration:
-                    music_track = afx.audio_loop(music_track, duration=final_duration)
-                else:
-                    music_track = music_track.set_duration(final_duration)
-                audio_tracks.append(music_track)
+        # --- Step 4: FFmpeg concat all segments ---
+        print("Concatenating segments...")
+        concat_start = time.time()
+        concat_list = f"{base_dir}/concat.txt"
+        with open(concat_list, 'w') as f:
+            for seg in segment_paths:
+                f.write(f"file '{seg}'\n")
 
-        if audio_tracks:
-            final_audio = CompositeAudioClip(audio_tracks) if len(audio_tracks) > 1 else audio_tracks[0]
-        else:
-            final_audio = None
+        video_only = f"{base_dir}/video_only.mp4"
+        result = subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            video_only
+        ], capture_output=True, text=True, timeout=120)
 
-        if final_audio:
-            video_layer = video_layer.set_audio(final_audio)
+        if result.returncode != 0:
+            # Fallback: re-encode concat
+            result = subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", concat_list,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-r", str(RENDER_FPS),
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                video_only
+            ], capture_output=True, text=True, timeout=120)
 
-        # --- Subtitles ---
-        def sub_generator(txt):
-            return TextClip(
-                txt,
-                font=font_path if font_path else 'Arial',
-                fontsize=100,
-                color='#fcba03',
-                stroke_color='black',
-                stroke_width=4,
-                method='caption',
-                size=(1000, None)
+        print(f"Concat done in {time.time()-concat_start:.1f}s")
+
+        # --- Step 5: Whisper transcription -> ASS subtitles ---
+        ass_path = None
+        if has_voiceover:
+            print("Transcribing voiceover...")
+            whisper_start = time.time()
+            segments_iter, _ = WHISPER_MODEL.transcribe(
+                local_audio, word_timestamps=True,
+                initial_prompt=script_hint, beam_size=5
             )
+            word_subs = []
+            for seg in segments_iter:
+                for w in seg.words:
+                    clean = w.word.strip().upper().replace('"', '').replace('.', '').replace(',', '')
+                    if clean:
+                        word_subs.append(((w.start, w.end), clean))
+            print(f"Transcription: {len(word_subs)} words in {time.time()-whisper_start:.1f}s")
 
-        if filled_subs:
-            subtitles = SubtitlesClip(filled_subs, sub_generator).set_position('center')
-            final_export = CompositeVideoClip([video_layer, subtitles])
+            # Group into 3-word chunks
+            chunks = group_words_into_chunks(word_subs, max_words=3)
+            # Fill gaps
+            filled = []
+            for j in range(len(chunks)):
+                start, end = chunks[j][0]
+                text = chunks[j][1]
+                if j == 0:
+                    start = 0.0
+                if j < len(chunks) - 1:
+                    next_start = chunks[j+1][0][0]
+                    if next_start > end:
+                        end = next_start
+                filled.append((start, end, text))
+
+            # Generate ASS subtitle file
+            ass_path = f"{base_dir}/subs.ass"
+            _generate_ass_file(ass_path, filled)
+
+        # --- Step 6: Burn subtitles into video ---
+        if ass_path and os.path.exists(ass_path):
+            print("Burning subtitles...")
+            sub_start = time.time()
+            video_with_subs = f"{base_dir}/video_subs.mp4"
+            result = subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_only,
+                "-vf", f"ass={ass_path}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-r", str(RENDER_FPS),
+                "-pix_fmt", "yuv420p",
+                "-an",
+                video_with_subs
+            ], capture_output=True, text=True, timeout=180)
+
+            if result.returncode == 0:
+                video_only = video_with_subs
+                print(f"Subtitles burned in {time.time()-sub_start:.1f}s")
+            else:
+                print(f"Subtitle burn failed: {result.stderr[:200]}")
+
+        # --- Step 7: Mix audio ---
+        local_music = f"{base_dir}/music.mp3"
+        has_music = False
+        if music_url:
+            if download_file(music_url, local_music):
+                has_music = True
+
+        mixed_audio = f"{base_dir}/mixed.aac"
+        has_mixed_audio = False
+
+        if has_voiceover and has_music:
+            print("Mixing voiceover + music...")
+            result = subprocess.run([
+                "ffmpeg", "-y",
+                "-i", local_audio,
+                "-stream_loop", "-1", "-i", local_music,
+                "-filter_complex",
+                "[1:a]volume=0.05[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[out]",
+                "-map", "[out]",
+                "-c:a", "aac", "-b:a", "192k",
+                "-t", str(final_duration),
+                mixed_audio
+            ], capture_output=True, text=True, timeout=60)
+            has_mixed_audio = result.returncode == 0
+        elif has_voiceover:
+            result = subprocess.run([
+                "ffmpeg", "-y", "-i", local_audio,
+                "-c:a", "aac", "-b:a", "192k", mixed_audio
+            ], capture_output=True, timeout=30)
+            has_mixed_audio = result.returncode == 0
+        elif has_music:
+            result = subprocess.run([
+                "ffmpeg", "-y", "-i", local_music,
+                "-af", "volume=0.3",
+                "-c:a", "aac", "-b:a", "192k",
+                "-t", str(final_duration),
+                mixed_audio
+            ], capture_output=True, timeout=30)
+            has_mixed_audio = result.returncode == 0
+
+        # --- Step 8: Mux video + audio ---
+        if has_mixed_audio:
+            print("Muxing video + audio...")
+            result = subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_only,
+                "-i", mixed_audio,
+                "-c:v", "copy", "-c:a", "copy",
+                "-shortest",
+                "-movflags", "+faststart",
+                output_path
+            ], capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                shutil.copy(video_only, output_path)
         else:
-            final_export = video_layer
+            shutil.copy(video_only, output_path)
 
-        # --- Render ---
-        print("Rendering...")
-        final_export.write_videofile(
-            output_path,
-            fps=RENDER_FPS,
-            codec="libx264",
-            audio_codec="aac",
-            preset=RENDER_PRESET,
-            threads=RENDER_THREADS
+        # --- Step 9: Upload to GCS ---
+        print("Uploading to GCS...")
+        gcs_client = gcs_storage.Client()
+        bucket = gcs_client.bucket(GCS_BUCKET)
+        blob = bucket.blob(f"generated_videos/{user_filename}")
+        blob.upload_from_filename(output_path)
+
+        credentials, _ = google.auth.default()
+        auth_req = gauth_requests.Request()
+        credentials.refresh(auth_req)
+        sa_email = getattr(credentials, 'service_account_email', SERVICE_ACCOUNT_EMAIL)
+
+        download_url = blob.generate_signed_url(
+            version="v4", expiration=datetime.timedelta(hours=1), method="GET",
+            service_account_email=sa_email, access_token=credentials.token
         )
 
+        # --- Done ---
+        processing_time = time.time() - job_start_time
         file_size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 2)
 
-        rendered_files[job_id] = {
-            "path": output_path,
+        webhook_payload = {
+            "status": "success",
+            "video_url": download_url,
+            "gcs_url": f"https://storage.googleapis.com/{GCS_BUCKET}/generated_videos/{user_filename}",
             "filename": user_filename,
-            "duration": round(final_duration, 2),
+            "duration_seconds": round(final_duration, 2),
+            "processing_time_seconds": round(processing_time, 2),
             "file_size_mb": file_size_mb,
-            "created_at": time.time(),
-            "status": "ready"
+            "resolution": "1080x1920",
+            "fps": RENDER_FPS
         }
 
-        print(f"Render complete: {user_filename} ({file_size_mb}MB)")
-
-        # Call webhook if provided
-        webhook_url = data.get('webhook_url')
+        print(f"=== RENDER DONE: {user_filename} ({file_size_mb}MB) in {round(processing_time)}s ===")
         if webhook_url:
-            requests.post(webhook_url, json={
-                "status": "success",
-                "job_id": job_id,
-                "filename": user_filename,
-                "download_url": f"/download/{job_id}",
-                "duration_seconds": round(final_duration, 2),
-                "file_size_mb": file_size_mb
-            })
+            requests.post(webhook_url, json=webhook_payload, timeout=10)
 
     except Exception as e:
         print(f"RENDER ERROR: {e}")
         traceback.print_exc()
-        rendered_files[job_id] = {"status": "error", "error": str(e)}
-        webhook_url = data.get('webhook_url')
         if webhook_url:
-            requests.post(webhook_url, json={"status": "error", "job_id": job_id, "error": str(e)})
+            try:
+                requests.post(webhook_url, json={"status": "error", "error": str(e)}, timeout=10)
+            except:
+                pass
     finally:
         try:
             shutil.rmtree(base_dir)
         except:
             pass
 
-# --- ROUTES ---
+
+def _generate_ass_file(ass_path, subtitle_entries):
+    """Generate ASS subtitle file with Poppins Medium styling.
+    subtitle_entries: list of (start_sec, end_sec, text)
+    """
+    def _format_ass_time(seconds):
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = seconds % 60
+        return f"{h}:{m:02d}:{s:05.2f}"
+
+    header = """[Script Info]
+Title: CashFlow Shorts Subtitles
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Poppins Medium,90,&H00FFFFFF,&H000000FF,&H00603400,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,2,40,40,350,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    with open(ass_path, 'w') as f:
+        f.write(header)
+        for start, end, text in subtitle_entries:
+            start_str = _format_ass_time(start)
+            end_str = _format_ass_time(end)
+            f.write(f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{text}\n")
+
+
+# =============================================
+# ROUTES
+# =============================================
 @app.route('/', methods=['POST'])
 def handle_request():
     data = request.json
-    job_id = uuid.uuid4().hex[:12]
-    rendered_files[job_id] = {"status": "rendering"}
-    threading.Thread(target=process_timeline_job, args=(data, job_id)).start()
-    return jsonify({"message": "Job started", "job_id": job_id}), 202
+    webhook_url = data.get('webhook_url')
+    if not webhook_url:
+        return jsonify({"error": "Missing 'webhook_url'"}), 400
+    threading.Thread(target=process_timeline_job, args=(data, webhook_url)).start()
+    return jsonify({"message": "Job started."}), 202
 
-@app.route('/status/<job_id>', methods=['GET'])
-def check_status(job_id):
-    if job_id not in rendered_files:
-        return jsonify({"error": "Job not found"}), 404
-    info = rendered_files[job_id]
-    return jsonify(info)
-
-@app.route('/download/<job_id>', methods=['GET'])
-def download_video(job_id):
-    if job_id not in rendered_files:
-        return jsonify({"error": "Job not found"}), 404
-    info = rendered_files[job_id]
-    if info.get('status') != 'ready':
-        return jsonify({"error": "Not ready", "status": info.get('status')}), 400
-    return send_file(info['path'], as_attachment=True, download_name=info['filename'])
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "rendered_count": len(rendered_files)})
+    return jsonify({"status": "ok"})
 
-# Cleanup old files (older than 1 hour)
-def cleanup_old_files():
-    while True:
-        time.sleep(3600)
-        now = time.time()
-        to_delete = []
-        for job_id, info in rendered_files.items():
-            if info.get('created_at') and now - info['created_at'] > 3600:
-                try:
-                    os.remove(info.get('path', ''))
-                except:
-                    pass
-                to_delete.append(job_id)
-        for jid in to_delete:
-            del rendered_files[jid]
-        if to_delete:
-            print(f"Cleaned up {len(to_delete)} old renders")
-
-cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
-cleanup_thread.start()
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

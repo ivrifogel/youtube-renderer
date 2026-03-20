@@ -12,10 +12,6 @@ import base64
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-import PIL.Image
-if not hasattr(PIL.Image, 'ANTIALIAS'):
-    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
-
 from flask import Flask, request, jsonify, send_file
 from google.cloud import storage as gcs_storage
 from faster_whisper import WhisperModel

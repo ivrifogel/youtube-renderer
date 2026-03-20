@@ -35,10 +35,6 @@ if GEMINI_API_KEY:
     except Exception as e:
         print(f"API Key Config Error: {e}")
 
-# Pre-download font at startup
-FONT_PATH = "/tmp/Poppins-Medium.ttf"
-FONT_URL = "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Medium.ttf"
-
 # --- PRE-LOAD WHISPER MODEL ---
 def _load_whisper_model():
     print("Pre-loading Whisper model...")
@@ -52,9 +48,10 @@ def _load_whisper_model():
         for f in ["model.bin", "config.json", "vocabulary.txt"]:
             path = f"{local_model_dir}/{f}"
             if not os.path.exists(path):
-                requests.get(f"{base_url}/{f}", timeout=30).raise_for_status()
+                r = requests.get(f"{base_url}/{f}", timeout=30)
+                r.raise_for_status()
                 with open(path, 'wb') as fh:
-                    fh.write(requests.get(f"{base_url}/{f}").content)
+                    fh.write(r.content)
         model = WhisperModel(local_model_dir, device="cpu", compute_type="int8")
     print(f"Whisper model loaded in {time.time()-start:.1f}s")
     return model
@@ -95,12 +92,6 @@ def download_file(url, local_filename):
     except Exception as e:
         print(f"  Download error: {e}")
         return None
-
-
-def download_font():
-    if not os.path.exists(FONT_PATH):
-        download_file(FONT_URL, FONT_PATH)
-    return FONT_PATH if os.path.exists(FONT_PATH) else None
 
 
 def get_video_duration(path):
@@ -358,12 +349,16 @@ def process_timeline_job(data, webhook_url):
                 "-pix_fmt", "yuv420p",
                 seg_path
             ]
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-
-            if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
-                segment_paths.append(seg_path)
-            else:
-                print(f"  Segment {idx} failed")
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=120)
+                if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+                    segment_paths.append(seg_path)
+                else:
+                    print(f"  Segment {idx} failed (empty output)")
+            except subprocess.TimeoutExpired:
+                print(f"  Segment {idx} timed out, skipping")
+            except Exception as seg_err:
+                print(f"  Segment {idx} error: {seg_err}")
 
         if not segment_paths:
             raise Exception("No segments extracted!")
@@ -426,8 +421,6 @@ def process_timeline_job(data, webhook_url):
             for j in range(len(chunks)):
                 start, end = chunks[j][0]
                 text = chunks[j][1]
-                if j == 0:
-                    start = 0.0
                 if j < len(chunks) - 1:
                     next_start = chunks[j+1][0][0]
                     if next_start > end:
@@ -547,7 +540,8 @@ def process_timeline_job(data, webhook_url):
             "processing_time_seconds": round(processing_time, 2),
             "file_size_mb": file_size_mb,
             "resolution": "1080x1920",
-            "fps": RENDER_FPS
+            "fps": RENDER_FPS,
+            "has_audio": has_mixed_audio
         }
 
         print(f"=== RENDER DONE: {user_filename} ({file_size_mb}MB) in {round(processing_time)}s ===")
@@ -570,7 +564,7 @@ def process_timeline_job(data, webhook_url):
 
 
 def _generate_ass_file(ass_path, subtitle_entries):
-    """Generate ASS subtitle file with Poppins Medium styling.
+    """Generate ASS subtitle file with Poppins styling.
     subtitle_entries: list of (start_sec, end_sec, text)
     """
     def _format_ass_time(seconds):
@@ -588,7 +582,7 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Poppins Medium,90,&H00FFFFFF,&H000000FF,&H00603400,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,2,40,40,350,1
+Style: Default,Poppins,90,&H00FFFFFF,&H000000FF,&H00603400,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,2,40,40,350,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -607,6 +601,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 @app.route('/', methods=['POST'])
 def handle_request():
     data = request.json
+    if not data:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
     webhook_url = data.get('webhook_url')
     if not webhook_url:
         return jsonify({"error": "Missing 'webhook_url'"}), 400
